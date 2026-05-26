@@ -12,16 +12,22 @@ from ..core import register
 from ..data.dataset.weak_geometry import masks_to_weak_geometry
 from ..misc.dist_utils import get_world_size, is_dist_available_and_initialized, is_main_process
 from .deim_criterion import DEIMCriterion
+from .sar_segmentation_head import SARSegmentationHead
 
 
 @register()
 class SARStage1Criterion(DEIMCriterion):
     CUSTOM_LOSSES = {'masks', 'weak_geometry'}
 
-    def __init__(self, *args, mask_diagnostics=False, mask_diagnostics_interval=100, **kwargs):
+    def __init__(self, *args, mask_diagnostics=False, mask_diagnostics_interval=100,
+                 mask_point_sample_ratio=0, oversample_ratio=3.0,
+                 importance_sample_ratio=0.75, **kwargs):
         super().__init__(*args, **kwargs)
         self.mask_diagnostics = mask_diagnostics
         self.mask_diagnostics_interval = int(mask_diagnostics_interval)
+        self.mask_point_sample_ratio = int(mask_point_sample_ratio)
+        self.oversample_ratio = float(oversample_ratio)
+        self.importance_sample_ratio = float(importance_sample_ratio)
 
     def _zero_loss(self, outputs):
         return outputs['pred_logits'].sum() * 0.0
@@ -41,7 +47,52 @@ class SARStage1Criterion(DEIMCriterion):
             return True
         return int(step) % max(self.mask_diagnostics_interval, 1) == 0
 
-    def _report_mask_resize_diagnostics(self, source_masks, resized_masks, resolution, step=None, branch='final'):
+    def _mask_device_dtype(self, pred_masks, outputs):
+        if isinstance(pred_masks, dict):
+            tensor = pred_masks['pixel_embed']
+        else:
+            tensor = pred_masks
+        return tensor.device, tensor.dtype
+
+    def _gather_pred_masks(self, pred_masks, src_idx):
+        if isinstance(pred_masks, dict):
+            return SARSegmentationHead.materialize_matched(pred_masks, src_idx)
+        return pred_masks[src_idx]
+
+    @staticmethod
+    def _point_sample(masks, point_coords, mode='bilinear'):
+        grid = point_coords.mul(2.0).sub(1.0).unsqueeze(2)
+        samples = F.grid_sample(
+            masks[:, None],
+            grid,
+            mode=mode,
+            align_corners=False,
+        )
+        return samples[:, 0, :, 0]
+
+    def _sample_points(self, logits):
+        if self.mask_point_sample_ratio <= 0:
+            return None
+        num_masks, height, width = logits.shape
+        if num_masks == 0:
+            return None
+        num_points = max(1, (height * width) // self.mask_point_sample_ratio)
+        num_sampled = max(num_points, int(num_points * self.oversample_ratio))
+        point_coords = torch.rand(num_masks, num_sampled, 2, device=logits.device)
+        with torch.no_grad():
+            point_logits = self._point_sample(logits.detach(), point_coords)
+            num_uncertain = min(num_points, int(num_points * self.importance_sample_ratio))
+            num_uncertain = max(1, num_uncertain)
+            topk = torch.topk(-point_logits.abs(), k=num_uncertain, dim=1).indices
+            uncertain_coords = point_coords.gather(1, topk.unsqueeze(-1).expand(-1, -1, 2))
+            num_random = num_points - num_uncertain
+            if num_random > 0:
+                random_coords = torch.rand(num_masks, num_random, 2, device=logits.device)
+                return torch.cat([uncertain_coords, random_coords], dim=1)
+            return uncertain_coords
+
+    def _report_mask_resize_diagnostics(self, source_masks, resized_masks, resolution, step=None,
+                                        branch='final', pred_masks=None):
         if not self._should_report_mask_diagnostics(step) or source_masks.numel() == 0:
             return
         source_areas = source_masks.detach().float().flatten(1).sum(1)
@@ -58,6 +109,33 @@ class SARStage1Criterion(DEIMCriterion):
             f"max={resized_areas.max().item():.2f}; "
             f"empty_fraction={empty_fraction:.4f}"
         )
+        if pred_masks is None:
+            return
+
+        pred_bin = (pred_masks.detach().sigmoid() > 0.5).float().flatten(1)
+        tgt_bin = (resized_masks.detach() > 0.5).float().flatten(1)
+        inter = (pred_bin * tgt_bin).sum(1)
+        pred_area = pred_bin.sum(1)
+        tgt_area = tgt_bin.sum(1)
+        dice = (2 * inter + 1) / (pred_area + tgt_area + 1)
+        iou = (inter + 1) / (pred_area + tgt_area - inter + 1)
+        groups = [
+            ('small', source_areas < 32),
+            ('medium', (source_areas >= 32) & (source_areas < 256)),
+            ('large', source_areas >= 256),
+        ]
+        parts = []
+        for name, keep in groups:
+            if keep.any():
+                missing = (resized_areas[keep] <= 0).float().mean().item()
+                parts.append(
+                    f"{name}:n={int(keep.sum().item())},"
+                    f"dice={dice[keep].mean().item():.4f},"
+                    f"iou={iou[keep].mean().item():.4f},"
+                    f"missing={missing:.4f}"
+                )
+        if parts:
+            print(f"[SARStage1][criterion][{branch}] matched mask diagnostics " + "; ".join(parts))
 
     def loss_masks(self, outputs, targets, indices, num_boxes, step=None, branch='final',
                    enable_diagnostics=True):
@@ -79,11 +157,13 @@ class SARStage1Criterion(DEIMCriterion):
                     "Disable mask-unsafe augmentations or update them to transform masks."
                 )
 
+        pred_masks = outputs['pred_masks']
         src_idx = self._get_src_permutation_idx(indices)
-        src_masks = outputs['pred_masks'][src_idx]
+        src_masks = self._gather_pred_masks(pred_masks, src_idx)
+        device, dtype = self._mask_device_dtype(pred_masks, outputs)
         target_masks = torch.cat([
             target['masks'][j] for target, (_, j) in zip(targets, indices)
-        ], dim=0).to(device=src_masks.device, dtype=src_masks.dtype)
+        ], dim=0).to(device=device, dtype=dtype)
 
         source_masks = target_masks
         target_masks = F.interpolate(
@@ -98,14 +178,23 @@ class SARStage1Criterion(DEIMCriterion):
                 src_masks.shape[-2:],
                 step=step,
                 branch=branch,
+                pred_masks=src_masks,
             )
 
+        point_coords = self._sample_points(src_masks)
+        if point_coords is not None:
+            src_for_loss = self._point_sample(src_masks, point_coords)
+            target_for_loss = self._point_sample(target_masks, point_coords, mode='nearest')
+        else:
+            src_for_loss = src_masks.flatten(1)
+            target_for_loss = target_masks.flatten(1)
+
         loss_bce = F.binary_cross_entropy_with_logits(
-            src_masks, target_masks, reduction='none')
+            src_for_loss, target_for_loss, reduction='none')
         loss_bce = loss_bce.flatten(1).mean(1).sum() / num_boxes
 
-        src_probs = src_masks.sigmoid().flatten(1)
-        target_flat = target_masks.flatten(1)
+        src_probs = src_for_loss.sigmoid().flatten(1)
+        target_flat = target_for_loss.flatten(1)
         numerator = 2 * (src_probs * target_flat).sum(1)
         denominator = src_probs.sum(1) + target_flat.sum(1)
         loss_dice = (1 - (numerator + 1) / (denominator + 1)).sum() / num_boxes

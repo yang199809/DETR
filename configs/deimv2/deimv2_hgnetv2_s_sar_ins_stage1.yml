@@ -40,6 +40,9 @@ DEIMv2_SAR_INS_STAGE1:
     dim_feedforward: 2048
     mask_hidden_dim: 128
     mask_output_stride: 8
+    mask_num_blocks: 3
+    use_mask_aux_loss: True
+    use_sparse_mask_train: True
     use_weak_geometry: True
     return_geometry: True
     enable_timing: True
@@ -67,6 +70,7 @@ SARInstancePostProcessor:
   debug: False
   debug_dir: ./outputs/deimv2_hgnetv2_s_sar_ins_stage1/debug_val
   debug_max_images: 5
+  mask_threshold: 0.5
   enable_timing: True
   timing_sync_cuda: False
 
@@ -148,12 +152,16 @@ SARStage1Criterion:
   reg_max: 32
   mask_diagnostics: True
   mask_diagnostics_interval: 50
+  mask_point_sample_ratio: 16
+  oversample_ratio: 3.0
+  importance_sample_ratio: 0.75
   matcher:
     type: HungarianMatcher
     weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 2, cost_mask_bce: 1.0, cost_mask_dice: 1.0}
     alpha: 0.25
     gamma: 2.0
     mask_cost_downsample_size: 64
+    mask_point_sample_ratio: 0
     mask_cost_valid_area_eps: 1.0e-6
     diagnostics: True
     diagnostics_interval: 50

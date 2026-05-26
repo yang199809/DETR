@@ -13,6 +13,7 @@ from scipy.optimize import linear_sum_assignment
 from typing import Dict
 
 from .box_ops import box_cxcywh_to_xyxy, generalized_box_iou, box_iou
+from .sar_segmentation_head import SARSegmentationHead
 
 from ..core import register
 from ..misc import dist_utils
@@ -33,7 +34,7 @@ class HungarianMatcher(nn.Module):
     def __init__(self, weight_dict, use_focal_loss=False, alpha=0.25, gamma=2.0,
                 change_matcher=False, iou_order_alpha=1.0, matcher_change_epoch=10000,
                 mask_cost_downsample_size=None, mask_cost_valid_area_eps=1e-6,
-                diagnostics=False, diagnostics_interval=100):
+                mask_point_sample_ratio=0, diagnostics=False, diagnostics_interval=100):
         """Creates the matcher
 
         Params:
@@ -49,6 +50,7 @@ class HungarianMatcher(nn.Module):
         self.cost_mask_dice = weight_dict.get('cost_mask_dice', 0.0)
         self.mask_cost_downsample_size = mask_cost_downsample_size
         self.mask_cost_valid_area_eps = float(mask_cost_valid_area_eps)
+        self.mask_point_sample_ratio = int(mask_point_sample_ratio)
         self.diagnostics = diagnostics
         self.diagnostics_interval = int(diagnostics_interval)
 
@@ -72,13 +74,18 @@ class HungarianMatcher(nn.Module):
             return True
         return int(step) % max(self.diagnostics_interval, 1) == 0
 
+    def _materialize_pred_masks(self, pred_masks):
+        if isinstance(pred_masks, dict):
+            return SARSegmentationHead.materialize_sparse(pred_masks)
+        return pred_masks
+
     def _compute_mask_cost(self, outputs, targets, step=None):
         if ((self.cost_mask_bce == 0 and self.cost_mask_dice == 0) or
                 'pred_masks' not in outputs or
                 not all('masks' in target for target in targets)):
             return None
 
-        pred_masks = outputs['pred_masks']
+        pred_masks = self._materialize_pred_masks(outputs['pred_masks'])
         bs, num_queries, mask_h, mask_w = pred_masks.shape
         if self.mask_cost_downsample_size is not None:
             size = int(self.mask_cost_downsample_size)
@@ -134,8 +141,14 @@ class HungarianMatcher(nn.Module):
 
         pred_flat = pred_masks.flatten(0, 1).flatten(1)
         target_flat = target_masks.flatten(1)
-        num_pixels = float(pred_flat.shape[-1])
         valid_target = target_flat.sum(1) > self.mask_cost_valid_area_eps
+        if self.mask_point_sample_ratio > 0 and pred_flat.shape[-1] > 0:
+            num_points = max(1, pred_flat.shape[-1] // self.mask_point_sample_ratio)
+            if num_points < pred_flat.shape[-1]:
+                point_idx = torch.randperm(pred_flat.shape[-1], device=pred_flat.device)[:num_points]
+                pred_flat = pred_flat[:, point_idx]
+                target_flat = target_flat[:, point_idx]
+        num_pixels = float(pred_flat.shape[-1])
 
         total_cost = pred_flat.new_zeros((pred_flat.shape[0], target_flat.shape[0]))
         if self.cost_mask_bce != 0:
@@ -178,6 +191,16 @@ class HungarianMatcher(nn.Module):
                 len(index_i) = len(index_j) = min(num_queries, num_target_boxes)
         """
         bs, num_queries = outputs["pred_logits"].shape[:2]
+        sizes = [len(v["boxes"]) for v in targets]
+        if sum(sizes) == 0:
+            empty = [
+                (
+                    torch.empty(0, dtype=torch.int64),
+                    torch.empty(0, dtype=torch.int64),
+                )
+                for _ in range(bs)
+            ]
+            return {'indices_o2m': empty} if return_topk else {'indices': empty}
 
         # We flatten to compute the cost matrices in a batch
         if self.use_focal_loss:
@@ -227,7 +250,6 @@ class HungarianMatcher(nn.Module):
 
         C = C.view(bs, num_queries, -1).cpu()
 
-        sizes = [len(v["boxes"]) for v in targets]
         C = torch.nan_to_num(C, nan=1.0)
         indices_pre = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))]
         indices = [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices_pre]

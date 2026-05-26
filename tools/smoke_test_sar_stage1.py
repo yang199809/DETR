@@ -112,6 +112,8 @@ def main():
                 'eval_idx': -1,
                 'enable_timing': True,
                 'mask_output_stride': 4,
+                'mask_num_blocks': 2,
+                'use_sparse_mask_train': False,
             }
         },
         SARStage1Criterion={
@@ -162,6 +164,34 @@ def main():
     assert 'loss_mask_bce_aux_0' in losses
     assert 'loss_mask_dice_aux_0' in losses
     assert_finite_losses(losses)
+
+    model.decoder.use_sparse_mask_train = True
+    outputs = model(samples, targets=targets)
+    assert isinstance(outputs['pred_masks'], dict)
+    assert isinstance(outputs['aux_outputs'][0]['pred_masks'], dict)
+    losses = criterion(outputs, targets, epoch=0, global_step=0)
+    assert_finite_losses(losses)
+
+    det_cfg = YAMLConfig(
+        'configs/deimv2/deimv2_hgnetv2_s_coco.yml',
+        eval_spatial_size=[args.size, args.size],
+        HGNetv2={'pretrained': False},
+        DEIMTransformer={
+            'num_queries': 20,
+            'num_denoising': 0,
+            'num_layers': 2,
+            'dim_feedforward': 512,
+            'eval_idx': -1,
+        },
+        use_amp=False,
+        use_ema=False,
+    )
+    det_model = det_cfg.model.to(device).eval()
+    with torch.no_grad():
+        det_outputs = det_model(samples)
+        assert 'pred_logits' in det_outputs
+        assert 'pred_boxes' in det_outputs
+        assert 'pred_masks' not in det_outputs
 
     print('SAR Stage-1 smoke test passed.')
 

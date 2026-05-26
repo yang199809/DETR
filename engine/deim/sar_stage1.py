@@ -13,6 +13,7 @@ import torch.nn.init as init
 from ..core import register
 from .deim_decoder import DEIMTransformer
 from .denoising import get_contrastive_denoising_training_group
+from .sar_segmentation_head import SARSegmentationHead
 
 
 @register()
@@ -172,6 +173,9 @@ class SARStage1DEIMTransformer(DEIMTransformer):
                  share_score_head=False,
                  mask_hidden_dim=128,
                  mask_output_stride=8,
+                 mask_num_blocks=None,
+                 use_mask_aux_loss=True,
+                 use_sparse_mask_train=False,
                  use_weak_geometry=True,
                  return_geometry=True,
                  enable_timing=False,
@@ -210,13 +214,19 @@ class SARStage1DEIMTransformer(DEIMTransformer):
         self.mask_hidden_dim = mask_hidden_dim
         self.mask_output_stride = int(mask_output_stride)
         self.mask_base_stride = min(feat_strides[:num_levels])
+        self.use_mask_aux_loss = use_mask_aux_loss
+        self.use_sparse_mask_train = use_sparse_mask_train
         self.use_weak_geometry = use_weak_geometry
         self.return_geometry = return_geometry
         self.enable_timing = enable_timing
         self.timing_sync_cuda = timing_sync_cuda
-        self.pixel_decoder = LightweightPixelDecoder(hidden_dim, mask_hidden_dim, num_levels)
-        self.mask_refine = self._build_mask_refine(mask_hidden_dim)
-        self.mask_head = QueryBasedMaskHead(hidden_dim, mask_hidden_dim)
+        self.mask_head = SARSegmentationHead(
+            in_dim=hidden_dim,
+            num_blocks=num_layers if mask_num_blocks is None else mask_num_blocks,
+            mask_hidden_dim=mask_hidden_dim,
+            mask_output_stride=self.mask_output_stride,
+            use_sparse_train=use_sparse_mask_train,
+        )
         self.weak_geometry_init = WeakGeometryQueryInit(hidden_dim)
 
     def _build_mask_refine(self, mask_hidden_dim):
@@ -269,6 +279,12 @@ class SARStage1DEIMTransformer(DEIMTransformer):
         if hasattr(self, 'mask_refine'):
             for module in self.mask_refine.modules():
                 if isinstance(module, nn.Conv2d):
+                    init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        init.constant_(module.bias, 0)
+        if hasattr(self, 'mask_head'):
+            for module in self.mask_head.modules():
+                if isinstance(module, (nn.Conv2d, nn.Linear)):
                     init.xavier_uniform_(module.weight)
                     if module.bias is not None:
                         init.constant_(module.bias, 0)
@@ -329,8 +345,13 @@ class SARStage1DEIMTransformer(DEIMTransformer):
     def forward(self, feats, targets=None):
         timings = {}
         memory, spatial_shapes = self._get_encoder_input(feats)
-        pixel_features = self.pixel_decoder(self._memory_to_feature_maps(memory, spatial_shapes))
-        pixel_features = self.mask_refine(pixel_features)
+        feature_maps = self._memory_to_feature_maps(memory, spatial_shapes)
+        # The highest-resolution encoded feature (normally stride 8) feeds the lightweight mask head.
+        spatial_feature = feature_maps[0]
+        image_size = (
+            spatial_feature.shape[-2] * self.mask_base_stride,
+            spatial_feature.shape[-1] * self.mask_base_stride,
+        )
 
         if self.training and self.num_denoising > 0:
             denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = \
@@ -379,11 +400,18 @@ class SARStage1DEIMTransformer(DEIMTransformer):
 
         final_queries = out_queries[-1]
         t0 = self._tic(final_queries)
-        pred_masks = self.mask_head(final_queries, pixel_features)
-        aux_pred_masks = None
-        if self.training and self.aux_loss:
-            # Deep mask supervision keeps segmentation query learning as dense as detection supervision.
-            aux_pred_masks = [self.mask_head(layer_queries, pixel_features) for layer_queries in out_queries[:-1]]
+        query_features = [layer_queries for layer_queries in out_queries]
+        mask_outputs = self.mask_head(
+            spatial_feature,
+            query_features,
+            image_size=image_size,
+            sparse=self.training and self.use_sparse_mask_train,
+        )
+        pred_masks = mask_outputs['pred_masks']
+        aux_pred_masks = []
+        if self.training and self.aux_loss and self.use_mask_aux_loss:
+            # Deep mask supervision keeps segmentation query learning closer to detection supervision density.
+            aux_pred_masks = mask_outputs['aux_pred_masks']
         self._toc(timings, 'mask_projection', t0, pred_masks)
 
         if self.training:
