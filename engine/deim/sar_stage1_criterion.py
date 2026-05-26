@@ -10,13 +10,18 @@ import torch.nn.functional as F
 
 from ..core import register
 from ..data.dataset.weak_geometry import masks_to_weak_geometry
-from ..misc.dist_utils import get_world_size, is_dist_available_and_initialized
+from ..misc.dist_utils import get_world_size, is_dist_available_and_initialized, is_main_process
 from .deim_criterion import DEIMCriterion
 
 
 @register()
 class SARStage1Criterion(DEIMCriterion):
     CUSTOM_LOSSES = {'masks', 'weak_geometry'}
+
+    def __init__(self, *args, mask_diagnostics=False, mask_diagnostics_interval=100, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.mask_diagnostics = mask_diagnostics
+        self.mask_diagnostics_interval = int(mask_diagnostics_interval)
 
     def _zero_loss(self, outputs):
         return outputs['pred_logits'].sum() * 0.0
@@ -29,7 +34,33 @@ class SARStage1Criterion(DEIMCriterion):
             if 'gt_center' not in target and 'masks' in target:
                 target.update(masks_to_weak_geometry(target['masks']))
 
-    def loss_masks(self, outputs, targets, indices, num_boxes):
+    def _should_report_mask_diagnostics(self, step):
+        if not self.mask_diagnostics or not is_main_process():
+            return False
+        if step is None:
+            return True
+        return int(step) % max(self.mask_diagnostics_interval, 1) == 0
+
+    def _report_mask_resize_diagnostics(self, source_masks, resized_masks, resolution, step=None, branch='final'):
+        if not self._should_report_mask_diagnostics(step) or source_masks.numel() == 0:
+            return
+        source_areas = source_masks.detach().float().flatten(1).sum(1)
+        resized_areas = resized_masks.detach().float().flatten(1).sum(1)
+        empty_fraction = (resized_areas <= 0).float().mean().item()
+        print(
+            f"[SARStage1][criterion][{branch}] GT mask area before resize "
+            f"mean={source_areas.mean().item():.2f} "
+            f"min={source_areas.min().item():.2f} "
+            f"max={source_areas.max().item():.2f}; "
+            f"after resize to {resolution[0]}x{resolution[1]} "
+            f"mean={resized_areas.mean().item():.2f} "
+            f"min={resized_areas.min().item():.2f} "
+            f"max={resized_areas.max().item():.2f}; "
+            f"empty_fraction={empty_fraction:.4f}"
+        )
+
+    def loss_masks(self, outputs, targets, indices, num_boxes, step=None, branch='final',
+                   enable_diagnostics=True):
         if 'pred_masks' not in outputs or self._num_matched(indices) == 0:
             zero = self._zero_loss(outputs)
             return {'loss_mask_bce': zero, 'loss_mask_dice': zero}
@@ -54,11 +85,20 @@ class SARStage1Criterion(DEIMCriterion):
             target['masks'][j] for target, (_, j) in zip(targets, indices)
         ], dim=0).to(device=src_masks.device, dtype=src_masks.dtype)
 
+        source_masks = target_masks
         target_masks = F.interpolate(
             target_masks[:, None],
             size=src_masks.shape[-2:],
             mode='nearest',
         )[:, 0]
+        if enable_diagnostics:
+            self._report_mask_resize_diagnostics(
+                source_masks,
+                target_masks,
+                src_masks.shape[-2:],
+                step=step,
+                branch=branch,
+            )
 
         loss_bce = F.binary_cross_entropy_with_logits(
             src_masks, target_masks, reduction='none')
@@ -144,14 +184,36 @@ class SARStage1Criterion(DEIMCriterion):
         num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
 
         custom_losses = {}
+        global_step = kwargs.get('global_step', None)
         if 'masks' in requested_losses:
-            custom_losses.update(self.loss_masks(outputs, targets, indices, num_boxes))
+            custom_losses.update(self.loss_masks(
+                outputs, targets, indices, num_boxes, step=global_step, branch='final'))
+            if 'aux_outputs' in outputs:
+                for aux_idx, aux_outputs in enumerate(outputs['aux_outputs']):
+                    if 'pred_masks' not in aux_outputs:
+                        continue
+                    aux_indices = self.matcher(
+                        aux_outputs, targets, epoch=epoch, step=global_step)['indices']
+                    aux_losses = self.loss_masks(
+                        aux_outputs,
+                        targets,
+                        aux_indices,
+                        num_boxes,
+                        step=global_step,
+                        branch=f'aux_{aux_idx}',
+                        enable_diagnostics=False,
+                    )
+                    custom_losses.update({
+                        f'{key}_aux_{aux_idx}': value for key, value in aux_losses.items()
+                    })
         if 'weak_geometry' in requested_losses:
             custom_losses.update(self.loss_weak_geometry(outputs, targets, indices, num_boxes))
 
-        custom_losses = {
-            key: value * self.weight_dict.get(key, 1.0)
-            for key, value in custom_losses.items()
-        }
+        weighted_custom_losses = {}
+        for key, value in custom_losses.items():
+            base_key = key.split('_aux_')[0] if '_aux_' in key else key
+            weighted_custom_losses[key] = value * self.weight_dict.get(
+                key, self.weight_dict.get(base_key, 1.0))
+        custom_losses = weighted_custom_losses
         losses.update(custom_losses)
         return {k: torch.nan_to_num(v, nan=0.0) for k, v in losses.items()}

@@ -171,6 +171,7 @@ class SARStage1DEIMTransformer(DEIMTransformer):
                  share_bbox_head=False,
                  share_score_head=False,
                  mask_hidden_dim=128,
+                 mask_output_stride=8,
                  use_weak_geometry=True,
                  return_geometry=True,
                  enable_timing=False,
@@ -207,13 +208,39 @@ class SARStage1DEIMTransformer(DEIMTransformer):
             share_score_head=share_score_head,
         )
         self.mask_hidden_dim = mask_hidden_dim
+        self.mask_output_stride = int(mask_output_stride)
+        self.mask_base_stride = min(feat_strides[:num_levels])
         self.use_weak_geometry = use_weak_geometry
         self.return_geometry = return_geometry
         self.enable_timing = enable_timing
         self.timing_sync_cuda = timing_sync_cuda
         self.pixel_decoder = LightweightPixelDecoder(hidden_dim, mask_hidden_dim, num_levels)
+        self.mask_refine = self._build_mask_refine(mask_hidden_dim)
         self.mask_head = QueryBasedMaskHead(hidden_dim, mask_hidden_dim)
         self.weak_geometry_init = WeakGeometryQueryInit(hidden_dim)
+
+    def _build_mask_refine(self, mask_hidden_dim):
+        """Optionally refine the stride-8 mask feature to a higher spatial resolution."""
+        if self.mask_output_stride == self.mask_base_stride:
+            return nn.Identity()
+        if self.mask_output_stride < self.mask_base_stride:
+            if self.mask_base_stride % self.mask_output_stride != 0:
+                raise ValueError(
+                    f"mask_output_stride={self.mask_output_stride} must divide "
+                    f"the base mask stride {self.mask_base_stride}"
+                )
+            scale_factor = self.mask_base_stride // self.mask_output_stride
+            return nn.Sequential(
+                nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=False),
+                ConvBlock(mask_hidden_dim),
+            )
+        if self.mask_output_stride % self.mask_base_stride != 0:
+            raise ValueError(
+                f"mask_output_stride={self.mask_output_stride} must be a multiple of "
+                f"the base mask stride {self.mask_base_stride}"
+            )
+        scale_factor = self.mask_output_stride // self.mask_base_stride
+        return nn.AvgPool2d(kernel_size=scale_factor, stride=scale_factor)
 
     def _sync(self, tensor):
         if self.timing_sync_cuda and torch.is_tensor(tensor) and tensor.is_cuda:
@@ -235,6 +262,12 @@ class SARStage1DEIMTransformer(DEIMTransformer):
         super()._reset_parameters(feat_channels)
         if hasattr(self, 'pixel_decoder'):
             for module in self.pixel_decoder.modules():
+                if isinstance(module, nn.Conv2d):
+                    init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        init.constant_(module.bias, 0)
+        if hasattr(self, 'mask_refine'):
+            for module in self.mask_refine.modules():
                 if isinstance(module, nn.Conv2d):
                     init.xavier_uniform_(module.weight)
                     if module.bias is not None:
@@ -297,6 +330,7 @@ class SARStage1DEIMTransformer(DEIMTransformer):
         timings = {}
         memory, spatial_shapes = self._get_encoder_input(feats)
         pixel_features = self.pixel_decoder(self._memory_to_feature_maps(memory, spatial_shapes))
+        pixel_features = self.mask_refine(pixel_features)
 
         if self.training and self.num_denoising > 0:
             denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = \
@@ -346,6 +380,10 @@ class SARStage1DEIMTransformer(DEIMTransformer):
         final_queries = out_queries[-1]
         t0 = self._tic(final_queries)
         pred_masks = self.mask_head(final_queries, pixel_features)
+        aux_pred_masks = None
+        if self.training and self.aux_loss:
+            # Deep mask supervision keeps segmentation query learning as dense as detection supervision.
+            aux_pred_masks = [self.mask_head(layer_queries, pixel_features) for layer_queries in out_queries[:-1]]
         self._toc(timings, 'mask_projection', t0, pred_masks)
 
         if self.training:
@@ -372,9 +410,13 @@ class SARStage1DEIMTransformer(DEIMTransformer):
             out['timings'] = timings
 
         if self.training and self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss2(
+            aux_outputs = self._set_aux_loss2(
                 out_logits[:-1], out_bboxes[:-1], out_corners[:-1], out_refs[:-1],
                 out_corners[-1], out_logits[-1])
+            if aux_pred_masks is not None:
+                for aux_output, aux_mask in zip(aux_outputs, aux_pred_masks):
+                    aux_output['pred_masks'] = aux_mask
+            out['aux_outputs'] = aux_outputs
             out['enc_aux_outputs'] = self._set_aux_loss(enc_topk_logits_list, enc_topk_bboxes_list)
             out['pre_outputs'] = {'pred_logits': pre_logits, 'pred_boxes': pre_bboxes}
             out['enc_meta'] = {'class_agnostic': self.query_select_method == 'agnostic'}

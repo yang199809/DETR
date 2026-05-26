@@ -39,6 +39,7 @@ DEIMv2_SAR_INS_STAGE1:
     mlp_act: silu
     dim_feedforward: 2048
     mask_hidden_dim: 128
+    mask_output_stride: 8
     use_weak_geometry: True
     return_geometry: True
     enable_timing: True
@@ -150,6 +151,8 @@ SARStage1Criterion:
   gamma: 1.5
   alpha: 0.75
   reg_max: 32
+  mask_diagnostics: True
+  mask_diagnostics_interval: 50
   matcher:
     type: HungarianMatcher
     weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 2, cost_mask_bce: 1.0, cost_mask_dice: 1.0}

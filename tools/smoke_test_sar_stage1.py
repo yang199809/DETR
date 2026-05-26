@@ -111,7 +111,12 @@ def main():
                 'dim_feedforward': 512,
                 'eval_idx': -1,
                 'enable_timing': True,
+                'mask_output_stride': 4,
             }
+        },
+        SARStage1Criterion={
+            'mask_diagnostics': True,
+            'mask_diagnostics_interval': 1,
         },
         SARInstancePostProcessor={
             'num_top_queries_bbox': 20,
@@ -138,6 +143,7 @@ def main():
         assert outputs['pred_logits'].shape[:2] == (2, 20)
         assert outputs['pred_boxes'].shape[:2] == (2, 20)
         assert outputs['pred_masks'].shape[:2] == (2, 20)
+        assert outputs['pred_masks'].shape[-1] >= args.size // 4
         orig_size = torch.tensor([[args.size * 2, args.size + 16]] * 2, device=device)
         results = postprocessor(outputs, orig_size, targets=targets)
         assert 'masks' in results[0]
@@ -151,7 +157,10 @@ def main():
 
     model.train()
     outputs = model(samples, targets=targets)
+    assert outputs['aux_outputs'][0]['pred_masks'].shape[:2] == (2, 20)
     losses = criterion(outputs, targets, epoch=0, global_step=0)
+    assert 'loss_mask_bce_aux_0' in losses
+    assert 'loss_mask_dice_aux_0' in losses
     assert_finite_losses(losses)
 
     print('SAR Stage-1 smoke test passed.')
