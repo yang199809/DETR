@@ -1,0 +1,12 @@
+__include__: [
+  './deimv2_hgnetv2_s_sar_ins_stage1.yml'
+]
+
+output_dir: ./outputs/deimv2_hgnetv2_s_sar_ins_stage1_stride4
+
+DEIMv2_SAR_INS_STAGE1:
+  decoder:
+    mask_output_stride: 4
+
+SARInstancePostProcessor:
+  debug_dir: ./outputs/deimv2_hgnetv2_s_sar_ins_stage1_stride4/debug_val

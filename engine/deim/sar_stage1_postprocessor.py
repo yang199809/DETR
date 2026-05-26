@@ -41,6 +41,7 @@ class SARInstancePostProcessor(nn.Module):
                  debug_dir='outputs/sar_stage1_debug',
                  debug_max_images=5,
                  debug_score_threshold=0.25,
+                 mask_threshold=0.5,
                  enable_timing=False,
                  timing_sync_cuda=False):
         super().__init__()
@@ -56,6 +57,7 @@ class SARInstancePostProcessor(nn.Module):
         self.debug_dir = debug_dir
         self.debug_max_images = int(debug_max_images)
         self.debug_score_threshold = float(debug_score_threshold)
+        self.mask_threshold = float(mask_threshold)
         self.enable_timing = enable_timing
         self.timing_sync_cuda = timing_sync_cuda
         self._debug_saved = 0
@@ -208,7 +210,7 @@ class SARInstancePostProcessor(nn.Module):
                 )
                 self._toc(timings, 'mask_upsampling', t0, mask_logits)
                 t0 = self._tic(mask_logits)
-                result['masks'] = mask_logits.sigmoid()
+                result['masks'] = (mask_logits.sigmoid() > self.mask_threshold).to(mask_logits.dtype)
                 self._toc(timings, 'threshold_sigmoid', t0, result['masks'])
                 result['mask_labels'] = mask_labels[batch_idx]
                 result['mask_boxes'] = mask_boxes[batch_idx]

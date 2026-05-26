@@ -14,7 +14,7 @@ train_dataloader:
     img_folder: /home/shuangy/DEIMv2/data/coco/images
     ann_file: /home/shuangy/DEIMv2/data/coco/annotations/train2017.json
     return_masks: True
-    return_weak_geometry: True
+    return_weak_geometry: False
     use_category2label: True
     transforms:
       type: Compose
